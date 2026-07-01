@@ -634,9 +634,16 @@ def scrape_home(page, index_ids, periods, kline_periods=None, skip_steamdt=False
     return result
 
 
-def run_csqaq_thread(index_ids, periods, kline_periods):
-    """D3线程1：独立Playwright实例运行CSQAQ采集（跳过SteamDT）"""
-    print(f"\n[D3-CSQAQ] 启动独立线程...", flush=True)
+def run_csqaq_subset_thread(subset_index_ids, periods, kline_periods, group_id):
+    """D4线程：独立Playwright实例运行CSQAQ子集采集（跳过SteamDT）
+
+    Args:
+        subset_index_ids: 该线程负责的指数ID子集
+        periods: sub_data周期
+        kline_periods: sub/kline周期
+        group_id: 分组ID（用于日志标识）
+    """
+    print(f"\n[D4-G{group_id}] 启动子集线程, 指数={subset_index_ids}...", flush=True)
     thread_start = datetime.datetime.now()
     try:
         with sync_playwright() as p:
@@ -656,28 +663,29 @@ def run_csqaq_thread(index_ids, periods, kline_periods):
             page = context.new_page()
 
             max_retries = 1
+            scrape_result = None
             for attempt in range(max_retries + 1):
-                scrape_result = scrape_home(page, index_ids, periods,
+                scrape_result = scrape_home(page, subset_index_ids, periods,
                                             kline_periods=kline_periods, skip_steamdt=True)
                 if scrape_result.get("scrape_ok") or attempt == max_retries:
                     break
-                print(f"\n[D3-CSQAQ] 第 {attempt+1} 次抓取失败，重试...", flush=True)
+                print(f"\n[D4-G{group_id}] 第 {attempt+1} 次抓取失败，重试...", flush=True)
                 page.goto("about:blank")
                 page.wait_for_timeout(1000)
 
             browser.close()
 
         elapsed = (datetime.datetime.now() - thread_start).total_seconds()
-        print(f"[D3-CSQAQ] 完成, 耗时 {elapsed:.0f}s", flush=True)
+        print(f"[D4-G{group_id}] 完成, 耗时 {elapsed:.0f}s", flush=True)
         return scrape_result
     except Exception as e:
-        print(f"[D3-CSQAQ] FATAL: {type(e).__name__}: {e}", flush=True)
+        print(f"[D4-G{group_id}] FATAL: {type(e).__name__}: {e}", flush=True)
         return {"scrape_ok": False, "scrape_fail": f"FATAL: {type(e).__name__}: {e}"}
 
 
 def run_steamdt_thread():
-    """D3线程2：独立Playwright实例运行SteamDT采集"""
-    print(f"\n[D3-SteamDT] 启动独立线程...", flush=True)
+    """D4线程：独立Playwright实例运行SteamDT采集"""
+    print(f"\n[D4-SteamDT] 启动独立线程...", flush=True)
     thread_start = datetime.datetime.now()
     try:
         from scrape_steamdt import scrape_steamdt
@@ -702,15 +710,15 @@ def run_steamdt_thread():
             browser.close()
 
         elapsed = (datetime.datetime.now() - thread_start).total_seconds()
-        print(f"[D3-SteamDT] 完成, 耗时 {elapsed:.0f}s", flush=True)
+        print(f"[D4-SteamDT] 完成, 耗时 {elapsed:.0f}s", flush=True)
         return steamdt_result
     except Exception as e:
-        print(f"[D3-SteamDT] FATAL: {type(e).__name__}: {e}", flush=True)
+        print(f"[D4-SteamDT] FATAL: {type(e).__name__}: {e}", flush=True)
         return {"scrape_ok": False, "scrape_fail": f"FATAL: {type(e).__name__}: {e}"}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CSQAQ 首页饰品指数抓取（D3双context并行）")
+    parser = argparse.ArgumentParser(description="CSQAQ 首页饰品指数抓取（D4 6context并行）")
     parser.add_argument("--indices", default="", help="逗号分隔的指数 ID（默认全部）")
     parser.add_argument("--periods", default="", help="逗号分隔的 sub_data 周期（默认 daily,hours）")
     parser.add_argument("--kline-periods", default="",
@@ -718,7 +726,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60, flush=True)
-    print("  CSQAQ+SteamDT 双context并行抓取（D3模式）", flush=True)
+    print("  CSQAQ 6context并行抓取（D4全并行模式）", flush=True)
     print("=" * 60, flush=True)
 
     # 解析参数
@@ -740,15 +748,21 @@ def main():
     else:
         kline_periods = DEFAULT_KLINE_PERIODS
 
-    print(f"  指数: {index_ids}", flush=True)
+    # D4: 将指数分成6组（约4个/组）
+    num_groups = 6
+    chunk_size = (len(index_ids) + num_groups - 1) // num_groups
+    groups = [index_ids[i*chunk_size:(i+1)*chunk_size] for i in range(num_groups)]
+    for i, g in enumerate(groups):
+        print(f"  G{i+1}: {g}", flush=True)
+
     print(f"  sub_data 周期: {periods}", flush=True)
     print(f"  sub/kline 周期: {kline_periods}", flush=True)
-    print(f"  模式: D3 双context并行（CSQAQ + SteamDT 独立线程）", flush=True)
+    print(f"  模式: D4 全并行（{num_groups}组CSQAQ + 1个SteamDT = {num_groups+1}线程）", flush=True)
 
     start_time = datetime.datetime.now()
 
     result = {
-        "version": "v2_d3_parallel",
+        "version": "v2_d4_parallel",
         "start_time": start_time.isoformat(),
         "home_url": HOME_URL,
         "indices": index_ids,
@@ -757,24 +771,66 @@ def main():
         "data": None,
     }
 
-    # D3: 双线程并行采集
+    # D4: 7线程并行采集（6个CSQAQ子集 + 1个SteamDT）
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_csqaq = executor.submit(run_csqaq_thread, index_ids, periods, kline_periods)
+        with ThreadPoolExecutor(max_workers=num_groups + 1) as executor:
+            future_groups = {}
+            for i, group in enumerate(groups):
+                if group:
+                    future_groups[i+1] = executor.submit(
+                        run_csqaq_subset_thread, group, periods, kline_periods, i+1)
             future_steamdt = executor.submit(run_steamdt_thread)
 
-            csqaq_result = future_csqaq.result()
+            group_results = {}
+            for gid, future in future_groups.items():
+                group_results[gid] = future.result()
             steamdt_result = future_steamdt.result()
 
-        # 合并结果
-        if steamdt_result.get("scrape_ok"):
-            csqaq_result["steamdt_kline"] = steamdt_result.get("indices", {})
-            print(f"\n[D3] SteamDT 结果已合并到 CSQAQ 结果", flush=True)
-        else:
-            csqaq_result["steamdt_kline"] = {}
-            print(f"\n[D3] ⚠ SteamDT 采集失败: {steamdt_result.get('scrape_fail', 'unknown')}", flush=True)
+        # 合并4个CSQAQ子集结果
+        merged = {
+            "current_data": None,
+            "sub_data": {},
+            "sub_kline": {},
+            "rank_list": None,
+            "monitor_rank": None,
+            "steamdt_kline": {},
+            "scrape_ok": False,
+            "scrape_fail": "",
+        }
+        ok_count = 0
+        fail_msgs = []
+        for gid, gres in group_results.items():
+            if not gres:
+                fail_msgs.append(f"G{gid}:无结果")
+                continue
+            if gres.get("scrape_ok"):
+                ok_count += 1
+                if not merged["current_data"]:
+                    merged["current_data"] = gres.get("current_data")
+                if not merged["rank_list"]:
+                    merged["rank_list"] = gres.get("rank_list")
+                if not merged["monitor_rank"]:
+                    merged["monitor_rank"] = gres.get("monitor_rank")
+                g_sub_data = gres.get("sub_data", {})
+                g_sub_kline = gres.get("sub_kline", {})
+                merged["sub_data"].update(g_sub_data)
+                merged["sub_kline"].update(g_sub_kline)
+            else:
+                fail_msgs.append(f"G{gid}:{gres.get('scrape_fail', 'unknown')}")
 
-        result["data"] = csqaq_result
+        merged["scrape_ok"] = ok_count > 0
+        merged["scrape_fail"] = "; ".join(fail_msgs) if fail_msgs else ""
+
+        # 合并SteamDT结果
+        if steamdt_result.get("scrape_ok"):
+            merged["steamdt_kline"] = steamdt_result.get("indices", {})
+            print(f"\n[D4] SteamDT 结果已合并", flush=True)
+        else:
+            print(f"\n[D4] ⚠ SteamDT 采集失败: {steamdt_result.get('scrape_fail', 'unknown')}", flush=True)
+
+        print(f"[D4] CSQAQ子集成功: {ok_count}/{len(group_results)}", flush=True)
+
+        result["data"] = merged
 
     except Exception as e:
         print(f"\n[FATAL] {type(e).__name__}: {e}", flush=True)
